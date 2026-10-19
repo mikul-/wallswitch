@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""wallswitch-thumbs — build/refresh thumbnails for the wallpaper pickers.
+
+Cache: ~/.cache/wallswitch/thumbs/<name>.jpg  (thumb_size px, JPEG q85)
+Only regenerates thumbnails whose source is newer; decodes in parallel so
+hundreds of 4K wallpapers finish in a few seconds. Falls back to ImageMagick
+for webp/16-bit/odd PNGs (and when PyGObject/GdkPixbuf is unavailable).
+
+Usage: wallswitch-thumbs [--force] [--prune]
+  --force   regenerate everything
+  --prune   drop cached thumbnails whose source no longer exists
+"""
+
+import os
+import subprocess
+import sys
+from concurrent.futures import ProcessPoolExecutor
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB = os.path.normpath(os.path.join(HERE, "..", "lib", "wallswitch"))
+if os.path.isdir(LIB):
+    sys.path.insert(0, LIB)
+import common  # noqa: E402
+
+CFG = common.load_config()
+MAX = CFG["thumb_size"]
+
+
+def make(src):
+    dst = common.thumb_of(CFG, src)
+    try:
+        if os.path.exists(dst) and os.path.getmtime(dst) >= os.path.getmtime(src):
+            return None
+        try:
+            import gi
+            gi.require_version("GdkPixbuf", "2.0")
+            from gi.repository import GdkPixbuf
+            pixbuf = GdkPixbuf.Pixbuf.new_from_file_at_scale(src, MAX, MAX, True)
+            pixbuf.savev(dst, "jpeg", ["quality"], ["85"])
+            return dst
+        except Exception:  # noqa: BLE001
+            # fallback: ImageMagick (webp/16-bit/odd PNGs, lower memory)
+            subprocess.run(
+                ["magick", src, "-thumbnail", f"{MAX}x{MAX}",
+                 "-quality", "85", dst],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            return dst
+    except Exception as exc:  # noqa: BLE001
+        return ("ERR", src, str(exc))
+
+
+def main():
+    force = "--force" in sys.argv
+    prune = "--prune" in sys.argv
+    os.makedirs(os.path.join(CFG["cache_dir"], "thumbs"), exist_ok=True)
+
+    srcs = common.wallpapers(CFG)
+    if force:
+        for src in srcs:
+            try:
+                os.remove(common.thumb_of(CFG, src))
+            except OSError:
+                pass
+
+    if prune:
+        valid = {common.thumb_of(CFG, src) for src in srcs}
+        thumb_dir = os.path.join(CFG["cache_dir"], "thumbs")
+        for name in os.listdir(thumb_dir):
+            path = os.path.join(thumb_dir, name)
+            if path not in valid:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    todo = [
+        src for src in srcs
+        if not os.path.exists(common.thumb_of(CFG, src))
+        or os.path.getmtime(common.thumb_of(CFG, src)) < os.path.getmtime(src)
+    ]
+
+    if not todo:
+        print(f"thumbs: up to date ({len(srcs)})", file=sys.stderr)
+        return 0
+
+    done = errs = 0
+    # 8K PNGs are memory-hungry; keep the worker count modest.
+    workers = max(1, min(4, os.cpu_count() or 1))
+    with ProcessPoolExecutor(max_workers=workers) as ex:
+        for result in ex.map(make, todo, chunksize=4):
+            if isinstance(result, tuple):
+                errs += 1
+            elif result:
+                done += 1
+                if done % 25 == 0:
+                    print(f"thumbs: {done}/{len(todo)}", file=sys.stderr)
+
+    print(f"thumbs: {done} generated, {errs} errors, {len(srcs)} sources",
+          file=sys.stderr)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

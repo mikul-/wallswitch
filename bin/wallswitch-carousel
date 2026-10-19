@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+"""wallswitch-carousel — lightweight GTK4 layer-shell wallpaper picker.
+
+Fullscreen overlay: blurred wallpaper backdrop + a horizontal row of thumbnail
+cards. Navigate with Left/Right or the scroll wheel, click a card or press Enter
+to apply, Esc cancels.
+
+  wallswitch-carousel [carousel|toggle|next|prev|apply]
+
+Singleton: next/prev/toggle/apply are sent to the running instance over a FIFO;
+otherwise an overlay is opened (pre-selected +/-1 for next/prev). On apply the
+chosen path is printed to stdout (the `wallswitch` CLI applies it).
+
+Requires: GTK4 + PyGObject, gtk4-layer-shell, and a wlr-layer-shell compositor
+(mangowm, Hyprland, Sway, river, ...). Falls back to a fullscreen window if
+layer-shell is unavailable.
+"""
+
+import os
+import stat
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB = os.path.normpath(os.path.join(HERE, "..", "lib", "wallswitch"))
+if os.path.isdir(LIB):
+    sys.path.insert(0, LIB)
+import common  # noqa: E402
+
+# gtk4-layer-shell must be preloaded before libwayland-client (see its linking.md),
+# or the layer surface fails to initialise.
+_LS = "/usr/lib/libgtk4-layer-shell.so.0"
+if os.path.exists(_LS) and _LS not in os.environ.get("LD_PRELOAD", ""):
+    os.environ["LD_PRELOAD"] = (_LS + " " + os.environ.get("LD_PRELOAD", "")).strip()
+    os.execv(sys.executable, [sys.executable, os.path.abspath(__file__), *sys.argv[1:]])
+
+import gi  # noqa: E402
+
+gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
+gi.require_version("Gtk4LayerShell", "1.0")
+from gi.repository import Gdk, Gio, GLib, Gtk  # noqa: E402
+from gi.repository import Gtk4LayerShell as LayerShell  # noqa: E402
+
+CFG = common.load_config()
+CTL = os.path.join(CFG["cache_dir"], "ctl")
+ITEM_W, ITEM_H, SPACING, PAD = 300, 169, 14, 60
+LOAD_RADIUS = 10                    # thumbnails loaded around the selection
+
+
+def hex_rgba(hex_col, alpha):
+    h = hex_col.lstrip("#")
+    r, g, b = (int(h[i:i + 2], 16) for i in (0, 2, 4))
+    return f"rgba({r},{g},{b},{alpha})"
+
+
+def send(cmd):
+    """Send a command to a running instance; True if delivered.
+
+    Only a real FIFO counts as a running instance. A *regular* file at CTL
+    (e.g. left by `echo next > .../ctl`) used to accept the write and make
+    send() lie -> next/prev exited without opening the carousel. Treat
+    anything that isn't a FIFO as stale and remove it.
+    """
+    try:
+        if not stat.S_ISFIFO(os.stat(CTL).st_mode):
+            os.remove(CTL)
+            return False
+    except OSError:
+        return False
+    try:
+        fd = os.open(CTL, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return False
+    try:
+        os.write(fd, (cmd + "\n").encode())
+    finally:
+        os.close(fd)
+    return True
+
+
+class Carousel(Gtk.Application):
+    def __init__(self, start_idx):
+        super().__init__(application_id="wallswitch.carousel",
+                         flags=Gio.ApplicationFlags.NON_UNIQUE)
+        self.start_idx = start_idx
+        self.result = None
+        self.files = []
+        self.idx = 0
+        self.cards = []
+        self.loaded = set()
+        self.ctl_fd = -1
+        self.ready_at = 0.0
+        self.press_idx = -1
+
+    # -- FIFO control ---------------------------------------------------
+    def _setup_ctl(self):
+        os.makedirs(CFG["cache_dir"], exist_ok=True)
+        try:
+            os.remove(CTL)
+        except OSError:
+            pass
+        os.mkfifo(CTL)
+        self.ctl_fd = os.open(CTL, os.O_RDWR | os.O_NONBLOCK)
+        GLib.io_add_watch(self.ctl_fd, GLib.IO_IN, self._on_ctl)
+
+    def _on_ctl(self, fd, _cond):
+        try:
+            data = os.read(fd, 64).decode(errors="ignore")
+        except OSError:
+            return True
+        for line in data.split("\n"):
+            cmd = line.strip()
+            if cmd == "next":
+                self._select(self.idx + 1)
+            elif cmd == "prev":
+                self._select(self.idx - 1)
+            elif cmd in ("apply", "activate"):
+                self.result = self.files[self.idx]
+                self.quit()
+            elif cmd == "toggle":
+                self.quit()
+        return True
+
+    def _cleanup(self):
+        if self.ctl_fd >= 0:
+            try:
+                os.close(self.ctl_fd)
+            except OSError:
+                pass
+        try:
+            os.remove(CTL)
+        except OSError:
+            pass
+
+    # -- UI -------------------------------------------------------------
+    def do_activate(self):
+        self.files = common.wallpapers(CFG)
+        if not self.files:
+            self.quit()
+            return
+
+        c = common.palette(CFG)
+        self._apply_css(c)
+
+        win = Gtk.ApplicationWindow(application=self)
+        LayerShell.init_for_window(win)
+        LayerShell.set_layer(win, LayerShell.Layer.OVERLAY)
+        for edge in (LayerShell.Edge.TOP, LayerShell.Edge.BOTTOM,
+                     LayerShell.Edge.LEFT, LayerShell.Edge.RIGHT):
+            LayerShell.set_anchor(win, edge, True)
+        LayerShell.set_keyboard_mode(win, LayerShell.KeyboardMode.EXCLUSIVE)
+        LayerShell.set_namespace(win, "wallswitch-carousel")
+        if not LayerShell.is_layer_window(win):
+            win.fullscreen()   # fallback if layer-shell didn't bind
+
+        overlay = Gtk.Overlay()
+
+        bg = Gtk.Picture()
+        blur = common.blur_for(CFG, common.current(CFG))
+        if blur:
+            bg.set_filename(blur)
+        bg.set_content_fit(Gtk.ContentFit.COVER)
+        overlay.set_child(bg)
+
+        tint = Gtk.Box()
+        tint.add_css_class("tint")
+        overlay.add_overlay(tint)
+
+        content = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        content.set_valign(Gtk.Align.CENTER)
+        content.set_halign(Gtk.Align.FILL)
+        overlay.add_overlay(content)
+
+        self.header = Gtk.Label(label="")
+        self.header.add_css_class("header")
+        content.append(self.header)
+
+        # horizontal row of cards (GtkBox, not FlowBox: FlowBox wraps by height
+        # and therefore can't scroll in a single long row)
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=SPACING)
+        row.set_halign(Gtk.Align.START)
+        row.set_margin_start(PAD)
+        row.set_margin_end(PAD)
+        row.set_margin_top(6)
+        row.set_margin_bottom(6)
+
+        for i, f in enumerate(self.files):
+            card = Gtk.Box()
+            card.add_css_class("card")
+            pic = Gtk.Picture()
+            pic.set_content_fit(Gtk.ContentFit.COVER)
+            pic.set_size_request(ITEM_W, ITEM_H)
+            pic.add_css_class("thumb")
+            card.append(pic)
+            click = Gtk.GestureClick()
+            click.set_button(1)
+            click.connect("pressed", self._on_press, i)
+            click.connect("released", self._on_click, i)
+            card.add_controller(click)
+            row.append(card)
+            self.cards.append(pic)
+
+        self.scroll = Gtk.ScrolledWindow()
+        self.scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.scroll.set_hexpand(True)
+        self.scroll.set_valign(Gtk.Align.CENTER)
+        self.scroll.set_child(row)
+        content.append(self.scroll)
+
+        hint = Gtk.Label(label="←/→ or scroll  ·  click or Enter apply  ·  Esc cancel")
+        hint.add_css_class("hint")
+        content.append(hint)
+
+        win.set_child(overlay)
+
+        key = Gtk.EventControllerKey()
+        key.connect("key-pressed", self._on_key)
+        win.add_controller(key)
+
+        sc = Gtk.EventControllerScroll.new(
+            Gtk.EventControllerScrollFlags.VERTICAL | Gtk.EventControllerScrollFlags.HORIZONTAL)
+        sc.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        sc.connect("scroll", self._on_scroll)
+        win.add_controller(sc)
+
+        self.win = win
+        win.present()
+        # ignore pointer releases that arrive while the overlay is appearing
+        # (the button release from the keybind that opened us lands on a card
+        # and would "click" it -> applied a seemingly random wallpaper)
+        self.ready_at = time.monotonic() + 0.45
+
+        self.idx = self.start_idx % len(self.files)
+        GLib.idle_add(self._select, self.idx)
+        GLib.timeout_add(250, lambda: (self._center(self.idx), False)[1])
+        self._setup_ctl()
+
+    def _apply_css(self, c):
+        css = f"""
+        window {{ background: transparent; }}
+        .tint {{ background: {hex_rgba(c['surface'], 0.30)}; }}
+        .header {{ color: {c['on_surface']}; font-family: "JetBrainsMono Nerd Font", monospace;
+                   font-size: 20px; font-weight: bold; }}
+        .hint {{ color: {c['on_surface_variant']}; font-family: "JetBrainsMono Nerd Font", monospace;
+                 font-size: 13px; }}
+        .thumb {{ border-radius: 10px; border: 2px solid transparent; }}
+        .card:hover .thumb {{ border: 2px solid {c['outline']}; }}
+        /* _select() adds .selected to the Gtk.Picture itself, so target .thumb.selected
+           (three classes + last rule, so it also wins over :hover). */
+        .card .thumb.selected {{ border: 3px solid {c['primary']}; }}
+        """
+        prov = Gtk.CssProvider()
+        prov.load_from_string(css)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), prov, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
+    def _load_window(self, center):
+        want = set(range(max(0, center - LOAD_RADIUS),
+                         min(len(self.files), center + LOAD_RADIUS + 1)))
+        for i in (want - self.loaded):
+            t = common.thumb_of(CFG, self.files[i])
+            if os.path.exists(t):
+                self.cards[i].set_filename(t)
+            self.loaded.add(i)
+        for i in (self.loaded - want):
+            self.cards[i].set_paintable(None)   # free the texture
+            self.loaded.discard(i)
+
+    def _select(self, idx):
+        if not self.files:
+            return False
+        self.idx = idx % len(self.files)
+        for i, pic in enumerate(self.cards):
+            if i == self.idx:
+                pic.add_css_class("selected")
+            else:
+                pic.remove_css_class("selected")
+        self.header.set_label(os.path.basename(self.files[self.idx]))
+        self._load_window(self.idx)
+        self._center(self.idx)
+        return False
+
+    def _center(self, idx):
+        adj = self.scroll.get_hadjustment()
+        if not adj:
+            return False
+        view = adj.get_page_size()
+        x = PAD + idx * (ITEM_W + SPACING) + ITEM_W / 2.0
+        lo, hi = adj.get_lower(), adj.get_upper() - view
+        adj.set_value(min(max(x - view / 2.0, lo), max(lo, hi)))
+        return False
+
+    def _on_press(self, _gesture, n, x, y, idx):
+        self.press_idx = idx
+
+    def _on_click(self, _gesture, n, x, y, idx):
+        # Only apply on a release that had a matching press on the same card, so
+        # stray button-release events (e.g. the keybind's own release landing on
+        # the overlay) can't apply a wallpaper.
+        if time.monotonic() < self.ready_at or self.press_idx != idx:
+            return
+        self.press_idx = -1
+        self.result = self.files[idx]
+        self.quit()
+
+    def _on_key(self, _c, keyval, _code, _state):
+        if keyval == Gdk.KEY_Left:
+            self._select(self.idx - 1)
+        elif keyval == Gdk.KEY_Right:
+            self._select(self.idx + 1)
+        elif keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter):
+            self.result = self.files[self.idx]
+            self.quit()
+        elif keyval == Gdk.KEY_Escape:
+            self.quit()
+        else:
+            return False
+        return True
+
+    def _on_scroll(self, _c, dx, dy):
+        if dy > 0 or dx > 0:
+            self._select(self.idx + 1)
+        elif dy < 0 or dx < 0:
+            self._select(self.idx - 1)
+        return True
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else "carousel"
+
+    # "carousel" on an already-open overlay toggles it closed instead of
+    # opening a second instance (which would steal the FIFO from the first).
+    send_mode = "toggle" if mode == "carousel" else mode
+    if send_mode in ("toggle", "next", "prev", "apply") and send(send_mode):
+        return 0
+
+    files = common.wallpapers(CFG)
+    if not files:
+        print(f"wallswitch-carousel: no wallpapers in {CFG['wallpaper_dir']}",
+              file=sys.stderr)
+        return 1
+
+    try:
+        cur = common.current(CFG)
+        idx = files.index(cur)
+    except (OSError, ValueError):
+        idx = 0
+    if mode == "next":
+        idx = (idx + 1) % len(files)
+    elif mode == "prev":
+        idx = (idx - 1) % len(files)
+
+    app = Carousel(idx)
+    app.run([])
+    app._cleanup()
+    if app.result:
+        print(app.result)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

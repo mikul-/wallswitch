@@ -1,0 +1,10 @@
+{
+  "wallpaper_dir": "~/Pictures/Wallpapers",
+  "state_file": "~/.local/state/wallswitch/wallpaper",
+  "cache_dir": "~/.cache/wallswitch",
+  "apply_command": "",
+  "rofi_theme": "",
+  "palette_file": "",
+  "accent": "",
+  "thumb_size": 440
+}

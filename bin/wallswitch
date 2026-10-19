@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""wallswitch — pick, cycle and apply wallpapers.
+
+Two pickers (rofi list / GTK4 carousel), a thumbnail cache, and a configurable
+apply hook so it works with any Wayland compositor and any theme pipeline.
+
+Usage:
+  wallswitch pick | rofi     rofi list picker with image previews
+  wallswitch carousel        GTK4 layer-shell carousel picker
+  wallswitch next | prev     carousel next/prev (opens it when closed)
+  wallswitch apply <path>    apply a specific wallpaper
+  wallswitch list            print the wallpaper list
+  wallswitch thumbs          build/refresh the thumbnail cache
+  wallswitch config          show the effective configuration
+  wallswitch version         show the version
+
+Docs: https://github.com/mikul-/wallswitch
+"""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+LIB = os.path.normpath(os.path.join(HERE, "..", "lib", "wallswitch"))
+if os.path.isdir(LIB):
+    sys.path.insert(0, LIB)
+import common  # noqa: E402
+
+USAGE = __doc__.split("Docs:")[0].rstrip()
+
+
+def sibling(name):
+    """Path of a companion script: same dir first, then $PATH."""
+    local = os.path.join(HERE, name)
+    if os.path.exists(local):
+        return local
+    return shutil.which(name)
+
+
+def refresh_thumbs(cfg):
+    """Rebuild missing/stale thumbnails in the background."""
+    script = sibling("wallswitch-thumbs")
+    if not script:
+        return
+    try:
+        subprocess.Popen([sys.executable, script],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except OSError:
+        pass
+
+
+def marked_thumb(cfg, thumb):
+    """Copy of `thumb` with a thick accent border (marks the active wallpaper)."""
+    accent = common.palette(cfg)["primary"]
+    if not (accent and os.path.exists(thumb) and shutil.which("magick")):
+        return thumb
+    dst = os.path.join(cfg["cache_dir"], "active-thumb.jpg")
+    try:
+        common.ensure_dirs(cfg)
+        subprocess.run(
+            ["magick", thumb, "-bordercolor", accent, "-border", "6", dst],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except (OSError, subprocess.CalledProcessError):
+        return thumb
+    return dst
+
+
+def rofi_pick(cfg, files):
+    if not shutil.which("rofi"):
+        raise SystemExit("wallswitch: rofi not installed")
+
+    active_path = common.current(cfg)
+    active = -1
+    rows = []
+    for i, path in enumerate(files):
+        name = os.path.basename(path)
+        thumb = common.thumb_of(cfg, path)
+        label, icon = name, thumb
+        if active_path and path == active_path:
+            active = i
+            label = "✓ " + name
+            icon = marked_thumb(cfg, thumb)
+        meta = f"\0icon\x1f{icon}" if os.path.exists(icon) else ""
+        rows.append(label + meta)
+
+    cmd = ["rofi", "-dmenu", "-i", "-show-icons", "-p", "Wallpaper"]
+    theme = cfg["rofi_theme"] or os.path.join(common.share_dir(), "rofi.rasi")
+    if os.path.exists(theme):
+        cmd += ["-theme", theme]
+    if active >= 0:
+        cmd += ["-selected-row", str(active)]
+
+    proc = subprocess.run(cmd, input="\n".join(rows).encode(),
+                          stdout=subprocess.PIPE)
+    choice = proc.stdout.decode(errors="ignore").strip()
+    if choice.startswith("✓ "):
+        choice = choice[2:]
+    if not choice:
+        return None
+    path = os.path.join(cfg["wallpaper_dir"], choice)
+    return path if os.path.exists(path) else None
+
+
+def carousel(cfg, mode):
+    script = sibling("wallswitch-carousel")
+    if not script:
+        raise SystemExit("wallswitch: wallswitch-carousel not found")
+    proc = subprocess.run([sys.executable, script, mode],
+                          stdout=subprocess.PIPE)
+    out = proc.stdout.decode(errors="ignore").strip()
+    return out or None
+
+
+def run_thumbs(extra):
+    script = sibling("wallswitch-thumbs")
+    if not script:
+        raise SystemExit("wallswitch: wallswitch-thumbs not found")
+    return subprocess.run([sys.executable, script, *extra]).returncode
+
+
+def show_config(cfg):
+    print(f"config file: {common.config_path()}"
+          f"{'' if os.path.exists(common.config_path()) else '  (missing — defaults in use)'}")
+    print(f"share dir:   {common.share_dir()}")
+    for key in ("wallpaper_dir", "state_file", "cache_dir", "apply_command",
+                "rofi_theme", "palette_file", "accent", "thumb_size"):
+        value = cfg.get(key)
+        if value in ("", 0, None):
+            value = f"(default / auto)"
+            if key == "apply_command":
+                value = "(auto: awww/swww/swaybg/feh)"
+            elif key == "rofi_theme":
+                theme = os.path.join(common.share_dir(), "rofi.rasi")
+                value = f"(bundled) {theme}"
+        print(f"{key + ':':<15}{value}")
+    print(f"palette:     {json.dumps(common.palette(cfg), separators=(',', ':'))}")
+
+
+def main(argv):
+    args = argv[1:]
+    cmd = args[0] if args else "pick"
+
+    if cmd in ("-h", "--help", "help"):
+        print(USAGE)
+        return 0
+    if cmd in ("-v", "--version", "version"):
+        print(f"wallswitch {common.VERSION}")
+        return 0
+
+    cfg = common.load_config()
+    files = common.wallpapers(cfg)
+
+    if cmd == "config":
+        show_config(cfg)
+        return 0
+    if cmd == "list":
+        print("\n".join(files))
+        return 0
+    if cmd == "thumbs":
+        return run_thumbs(args[1:])
+    if cmd == "apply":
+        if len(args) < 2:
+            raise SystemExit("usage: wallswitch apply <path>")
+        common.apply(cfg, os.path.expanduser(args[1]))
+        return 0
+    if cmd in ("pick", "rofi"):
+        refresh_thumbs(cfg)
+        chosen = rofi_pick(cfg, files)
+        if chosen:
+            common.apply(cfg, chosen)
+        return 0
+    if cmd in ("carousel", "next", "prev"):
+        refresh_thumbs(cfg)
+        chosen = carousel(cfg, cmd)
+        if chosen:
+            common.apply(cfg, chosen)
+        return 0
+
+    print(USAGE, file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

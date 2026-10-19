@@ -1,0 +1,69 @@
+/* wallswitch — rofi theme for the list picker.
+ *
+ * Copy to ~/.config/wallswitch/rofi.rasi (or point "rofi_theme" at it) and edit
+ * the variables below. If you generate themes with matugen, replace the hex
+ * values with your template variables instead. */
+
+* {
+    bg:        #101418;
+    bg-alt:    #1a2129;
+    fg:        #dbe3ed;
+    fg-dim:    #9fb0c0;
+    accent:    #4edad4;
+    accent-fg: #003735;
+    outline:   #384956;
+
+    background-color: @bg;
+    text-color:       @fg;
+    font:             "JetBrainsMono Nerd Font 13";
+}
+
+window {
+    width: 68%;
+    border: 2px;
+    border-color: @outline;
+    border-radius: 16px;
+    padding: 14px;
+}
+
+inputbar {
+    background-color: @bg-alt;
+    text-color: @fg;
+    padding: 10px 14px;
+    border-radius: 10px;
+    spacing: 8px;
+}
+
+prompt  { text-color: @accent; }
+entry   { text-color: @fg; placeholder-color: @fg-dim; }
+case-indicator { text-color: @fg-dim; }
+
+listview {
+    columns: 1;
+    lines: 6;
+    spacing: 8px;
+    padding: 10px 0 0 0;
+    scrollbar: false;
+}
+
+element {
+    padding: 8px 12px;
+    spacing: 14px;
+    border-radius: 10px;
+    background-color: @bg-alt;
+}
+
+element selected {
+    background-color: @accent;
+    text-color: @accent-fg;
+}
+
+element-icon {
+    size: 220px;
+    border-radius: 8px;
+}
+
+element-text {
+    text-color: inherit;
+    vertical-align: 0.5;
+}
